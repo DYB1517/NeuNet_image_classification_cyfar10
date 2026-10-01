@@ -1,182 +1,117 @@
+
+import os
 import time
+import random
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+import mlflow
+from torch.utils.data import TensorDataset, DataLoader, Subset
+from torchvision import transforms
 from tqdm import tqdm
 
 from src.data import load_cifar10
-from src.preprocessing import preprocess_images
-from src.augmentation import get_scaling_flipping
-from src.model import MLP
+from src.model import MLPMixer
 
+
+# =========================
+# CONFIGURATION
+# =========================
 
 BATCH_SIZE = 128
-EPOCHS = 30
-LEARNING_RATE = 0.001
+EPOCHS = 100
+LEARNING_RATE = 0.05
+MOMENTUM = 0.9
+WEIGHT_DECAY = 0.0001
 
-HIDDEN1_SIZE = 256
-HIDDEN2_SIZE = 128
-HIDDEN3_SIZE = 64
+VAL_SIZE = 5000
+NUM_WORKERS = 0
 
+MODEL_PATH = "best_mixer.pth"
+SEED = 42
+
+
+# =========================
+# REPRODUCIBILITY
+# =========================
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# =========================
+# DEVICE
+# =========================
 
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-
     return torch.device("cpu")
 
 
-def apply_augmentation(images, augmentation):
-    augmented_images = []
+# =========================
+# DATA PREPARATION
+# =========================
 
-    for image in images:
-        image = image.reshape(3, 32, 32)
-        image = np.transpose(image, (1, 2, 0))
-
-        result = augmentation(image=image)
-        augmented_image = result["image"]
-
-        augmented_image = np.transpose(
-            augmented_image,
-            (2, 0, 1)
-        )
-
-        augmented_images.append(augmented_image)
-
-    return np.asarray(
-        augmented_images,
-        dtype=np.uint8
-    )
-
-
-def calculate_accuracy(model, loader, device):
-    model.eval()
-
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-
-            logits = model(X_batch)
-            predictions = torch.argmax(
-                logits,
-                dim=1
-            )
-
-            correct += (
-                predictions == y_batch
-            ).sum().item()
-
-            total += y_batch.size(0)
-
-    return correct / total
-
-
-def calculate_loss(model, loader, loss_function, device):
-    model.eval()
-
-    total_loss = 0.0
-    total_samples = 0
-
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-
-            logits = model(X_batch)
-
-            loss = loss_function(
-                logits,
-                y_batch
-            )
-
-            batch_size = y_batch.size(0)
-
-            total_loss += (
-                loss.item() * batch_size
-            )
-
-            total_samples += batch_size
-
-    return total_loss / total_samples
-
-
-def train():
+def prepare_data():
     print("Loading CIFAR-10...")
 
     X_train, y_train, X_test, y_test = load_cifar10()
 
-    device = get_device()
+    # Validation split
+    indices = np.random.permutation(len(X_train))
 
-    print()
-    print("Device:", device)
+    val_indices = indices[:VAL_SIZE]
+    train_indices = indices[VAL_SIZE:]
 
-    if device.type == "cuda":
-        print(
-            "GPU:",
-            torch.cuda.get_device_name(0)
-        )
+    X_train_part = X_train[train_indices]
+    y_train_part = y_train[train_indices]
 
-    print()
+    X_val = X_train[val_indices]
+    y_val = y_train[val_indices]
 
-    print("=== TRAINING CONFIGURATION ===")
+    # Convert to image format [N, 3, 32, 32]
+    X_train_part = X_train_part.reshape(-1, 3, 32, 32)
+    X_val = X_val.reshape(-1, 3, 32, 32)
+    X_test = X_test.reshape(-1, 3, 32, 32)
 
-    print(
-        f"Architecture: 3072 -> "
-        f"{HIDDEN1_SIZE} -> "
-        f"{HIDDEN2_SIZE} -> "
-        f"{HIDDEN3_SIZE} -> 10"
+    # Normalize to [0, 1]
+    X_train_part = X_train_part.astype(np.float32) / 255.0
+    X_val = X_val.astype(np.float32) / 255.0
+    X_test = X_test.astype(np.float32) / 255.0
+
+    # Data augmentation
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+    ])
+
+    # Convert arrays to tensors
+    X_train_tensor = torch.from_numpy(X_train_part)
+    y_train_tensor = torch.from_numpy(
+        y_train_part.astype(np.int64)
     )
 
-    print("Batch size:", BATCH_SIZE)
-    print("Epochs:", EPOCHS)
-    print("Learning rate:", LEARNING_RATE)
-    print("Augmentation: Scaling + Flipping")
+    X_val_tensor = torch.from_numpy(X_val)
+    y_val_tensor = torch.from_numpy(y_val.astype(np.int64))
 
-    model = MLP(
-        input_size=3072,
-        hidden1_size=HIDDEN1_SIZE,
-        hidden2_size=HIDDEN2_SIZE,
-        hidden3_size=HIDDEN3_SIZE,
-        output_size=10
+    X_test_tensor = torch.from_numpy(X_test)
+    y_test_tensor = torch.from_numpy(y_test.astype(np.int64))
+
+    train_dataset = TensorDataset(
+        X_train_tensor,
+        y_train_tensor
     )
 
-    model = model.to(device)
-
-    parameters = model.count_parameters()
-
-    print("Trainable parameters:", parameters)
-
-    if parameters > 1_000_000:
-        raise ValueError(
-            "Number of parameters exceeds 1,000,000!"
-        )
-
-    loss_function = nn.CrossEntropyLoss()
-
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=LEARNING_RATE
-    )
-
-    augmentation = get_scaling_flipping()
-
-    print()
-    print("Preparing test data...")
-
-    X_test = preprocess_images(X_test)
-
-    X_test_tensor = torch.from_numpy(
-        X_test
-    )
-
-    y_test_tensor = torch.from_numpy(
-        y_test.astype(np.int64)
+    val_dataset = TensorDataset(
+        X_val_tensor,
+        y_val_tensor
     )
 
     test_dataset = TensorDataset(
@@ -184,195 +119,322 @@ def train():
         y_test_tensor
     )
 
+    # Apply augmentation only to training data
+    class AugmentedDataset(torch.utils.data.Dataset):
+        def __init__(self, dataset, transform):
+            self.dataset = dataset
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.dataset)
+
+        def __getitem__(self, index):
+            image, label = self.dataset[index]
+            image = self.transform(image)
+            return image, label
+
+    train_dataset = AugmentedDataset(
+        train_dataset,
+        train_transform
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available()
+    )
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=False
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available()
     )
 
-    print(
-        "Test shape:",
-        X_test.shape
-    )
+    print("Training samples:", len(train_dataset))
+    print("Validation samples:", len(val_dataset))
+    print("Test samples:", len(test_dataset))
 
-    print()
-    print("Preparing training evaluation data...")
+    return train_loader, val_loader, test_loader
 
-    X_train_eval = preprocess_images(
-        X_train[:10000]
-    )
 
-    y_train_eval = y_train[:10000]
+# =========================
+# METRICS
+# =========================
 
-    X_train_eval_tensor = torch.from_numpy(
-        X_train_eval
-    )
+def evaluate(model, loader, loss_function, device):
+    model.eval()
 
-    y_train_eval_tensor = torch.from_numpy(
-        y_train_eval.astype(np.int64)
-    )
+    total_loss = 0.0
+    correct = 0
+    total = 0
 
-    train_eval_dataset = TensorDataset(
-        X_train_eval_tensor,
-        y_train_eval_tensor
-    )
-
-    train_eval_loader = DataLoader(
-        train_eval_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False
-    )
-
-    print(
-        "Training evaluation shape:",
-        X_train_eval.shape
-    )
-
-    print()
-    print("=== TRAINING STARTED ===")
-
-    for epoch in range(1, EPOCHS + 1):
-
-        epoch_start = time.time()
-
-        model.train()
-
-        indices = np.random.permutation(
-            len(X_train)
-        )
-
-        X_train_shuffled = X_train[indices]
-        y_train_shuffled = y_train[indices]
-
-        epoch_loss = 0.0
-        samples_processed = 0
-
-        progress_bar = tqdm(
-            range(
-                0,
-                len(X_train),
-                BATCH_SIZE
-            ),
-            desc=f"Epoch {epoch}/{EPOCHS}"
-        )
-
-        for start in progress_bar:
-
-            end = min(
-                start + BATCH_SIZE,
-                len(X_train)
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(
+                device,
+                non_blocking=True
+            )
+            labels = labels.to(
+                device,
+                non_blocking=True
             )
 
-            X_batch = X_train_shuffled[
-                start:end
-            ]
+            logits = model(images)
 
-            y_batch = y_train_shuffled[
-                start:end
-            ]
+            loss = loss_function(logits, labels)
 
-            X_batch = apply_augmentation(
-                X_batch,
-                augmentation
-            )
+            batch_size = labels.size(0)
 
-            X_batch = preprocess_images(
-                X_batch
-            )
+            total_loss += loss.item() * batch_size
 
-            X_batch = torch.from_numpy(
-                X_batch
-            )
-
-            y_batch = torch.from_numpy(
-                y_batch.astype(np.int64)
-            )
-
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-
-            optimizer.zero_grad()
-
-            logits = model(X_batch)
-
-            loss = loss_function(
+            predictions = torch.argmax(
                 logits,
-                y_batch
+                dim=1
             )
 
-            loss.backward()
+            correct += (
+                predictions == labels
+            ).sum().item()
 
-            optimizer.step()
+            total += batch_size
 
-            batch_count = y_batch.size(0)
+    return total_loss / total, correct / total
 
-            epoch_loss += (
-                loss.item() * batch_count
-            )
 
-            samples_processed += batch_count
+# =========================
+# TRAINING
+# =========================
 
-            progress_bar.set_postfix(
-                loss=f"{loss.item():.4f}"
-            )
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    loss_function,
+    device,
+    scaler
+):
+    model.train()
 
-        epoch_loss /= samples_processed
+    total_loss = 0.0
+    total = 0
 
-        train_accuracy = calculate_accuracy(
-            model,
-            train_eval_loader,
-            device
+    progress = tqdm(
+        loader,
+        desc="Training",
+        leave=False
+    )
+
+    for images, labels in progress:
+        images = images.to(
+            device,
+            non_blocking=True
+        )
+        labels = labels.to(
+            device,
+            non_blocking=True
         )
 
-        test_loss = calculate_loss(
+        optimizer.zero_grad(set_to_none=True)
+
+        # Mixed precision on CUDA
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=(device.type == "cuda")
+        ):
+            logits = model(images)
+            loss = loss_function(logits, labels)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        batch_size = labels.size(0)
+
+        total_loss += loss.item() * batch_size
+        total += batch_size
+
+        progress.set_postfix(
+            loss=f"{loss.item():.4f}"
+        )
+
+    return total_loss / total
+
+def main():
+    set_seed(SEED)
+
+    device = get_device()
+    mlflow.set_experiment("CIFAR10_MLP_Mixer")
+
+    with mlflow.start_run():
+        mlflow.log_params({
+            "model": "MLP-Mixer",
+            "batch_size": BATCH_SIZE,
+            "epochs": EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            "momentum": MOMENTUM,
+            "weight_decay": WEIGHT_DECAY,
+            "optimizer": "SGD",
+            "scheduler": "CosineAnnealingLR",
+            "seed": SEED,
+            "val_size": VAL_SIZE,
+        })
+
+        print("Device:", device)
+
+        if device.type == "cuda":
+            print("GPU:", torch.cuda.get_device_name(0))
+            torch.backends.cudnn.benchmark = True
+
+        train_loader, val_loader, test_loader = prepare_data()
+
+        model = MLPMixer(
+            image_size=32,
+            patch_size=4,
+            channels=256,
+            token_hidden=128,
+            channel_hidden=512,
+            num_blocks=3,
+            num_classes=10
+        ).to(device)
+
+        parameters = model.count_parameters()
+        print("Model parameters:", parameters)
+
+        mlflow.log_param("model_parameters", parameters)
+
+        if parameters > 1_000_000:
+            raise ValueError("Parameter limit exceeded!")
+
+        loss_function = nn.CrossEntropyLoss()
+
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=LEARNING_RATE,
+            momentum=MOMENTUM,
+            weight_decay=WEIGHT_DECAY,
+            nesterov=True
+        )
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=EPOCHS,
+            eta_min=0.0001
+        )
+
+        scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=(device.type == "cuda")
+        )
+
+        best_accuracy = 0.0
+        best_epoch = 0
+        final_train_loss = 0.0
+
+        print("\n=== TRAINING STARTED ===")
+
+        for epoch in range(1, EPOCHS + 1):
+            start_time = time.time()
+
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                loss_function,
+                device,
+                scaler
+            )
+
+            val_loss, val_accuracy = evaluate(
+                model,
+                val_loader,
+                loss_function,
+                device
+            )
+
+            scheduler.step()
+            final_train_loss = train_loss
+
+            if val_accuracy > best_accuracy:
+                best_accuracy = val_accuracy
+                best_epoch = epoch
+
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "best_accuracy": best_accuracy,
+                        "val_loss": val_loss,
+                    },
+                    MODEL_PATH
+                )
+
+            elapsed = time.time() - start_time
+
+            mlflow.log_metrics({
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_accuracy": val_accuracy,
+                "learning_rate": scheduler.get_last_lr()[0],
+            }, step=epoch)
+
+            print(f"\nEpoch {epoch}/{EPOCHS}")
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Validation Loss: {val_loss:.4f}")
+            print(f"Validation Accuracy: {val_accuracy * 100:.2f}%")
+            print(f"Best Accuracy: {best_accuracy * 100:.2f}%")
+            print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+            print(f"Time: {elapsed:.2f}s")
+
+        # Load best checkpoint
+        checkpoint = torch.load(
+            MODEL_PATH,
+            map_location=device,
+            weights_only=True
+        )
+
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Final evaluation
+        test_loss, test_accuracy = evaluate(
             model,
             test_loader,
             loss_function,
             device
         )
 
-        test_accuracy = calculate_accuracy(
-            model,
-            test_loader,
-            device
-        )
+        mlflow.log_metrics({
+            "test_accuracy": test_accuracy,
+            "test_loss": test_loss,
+            "best_val_accuracy": best_accuracy,
+            "best_epoch": best_epoch,
+        })
 
-        epoch_time = (
-            time.time() - epoch_start
-        )
+        # Save checkpoint to MLflow
+        mlflow.log_artifact(MODEL_PATH)
 
-        print()
+        print("\n=== FINAL RESULTS ===")
+        print(f"Best Accuracy: {best_accuracy * 100:.2f}%")
+        print(f"Best Epoch: {best_epoch}")
+        print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
+        print(f"Train Loss: {final_train_loss:.4f}")
+        print(f"Test Loss: {test_loss:.4f}")
 
-        print(
-            f"Epoch {epoch}/{EPOCHS}"
-        )
-
-        print(
-            f"Train Loss: {epoch_loss:.4f}"
-        )
-
-        print(
-            f"Train Accuracy: "
-            f"{train_accuracy * 100:.2f}%"
-        )
-
-        print(
-            f"Test Loss: {test_loss:.4f}"
-        )
-
-        print(
-            f"Test Accuracy: "
-            f"{test_accuracy * 100:.2f}%"
-        )
-
-        print(
-            f"Time: {epoch_time:.2f} s"
-        )
-
-        print()
-
-    print("=== TRAINING COMPLETED ===")
+        print("\nTraining completed.")
 
 
 if __name__ == "__main__":
-    train()
+    main()
