@@ -8,11 +8,25 @@ import torch
 import torch.nn as nn
 import mlflow
 from torch.utils.data import TensorDataset, DataLoader, Subset
-from torchvision import transforms
 from tqdm import tqdm
 
 from src.data import load_cifar10
 from src.model import MLPMixer
+from src.augmentation import (
+    get_rotation_translation,
+    get_scaling_flipping,
+    get_brightness_contrast,
+    get_scaling_rotation,
+    get_cropping_flipping,
+    get_translation_brightness,
+    get_rotation_noise,
+    get_scaling_cropping,
+    get_contrast_noise,
+    get_noise_blurring,
+    get_rotation_translation_pair,
+    get_rotation_scaling_flipping,
+    get_geometric_four,
+)
 
 
 # =========================
@@ -20,7 +34,7 @@ from src.model import MLPMixer
 # =========================
 
 BATCH_SIZE = 128
-EPOCHS = 100
+EPOCHS = 30
 LEARNING_RATE = 0.05
 MOMENTUM = 0.9
 WEIGHT_DECAY = 0.0001
@@ -31,6 +45,8 @@ NUM_WORKERS = 0
 MODEL_PATH = "best_mixer.pth"
 SEED = 42
 
+# Выбраная аугментацыя для эксперыменту
+AUGMENTATION = "brightness_contrast"
 
 # =========================
 # REPRODUCIBILITY
@@ -54,12 +70,42 @@ def get_device():
         return torch.device("cuda")
     return torch.device("cpu")
 
+def build_augmentation(name):
+    augmentations = {
+        "rotation_translation": get_rotation_translation,
+        "scaling_flipping": get_scaling_flipping,
+        "brightness_contrast": get_brightness_contrast,
+
+        "scaling_rotation": get_scaling_rotation,
+        "cropping_flipping": get_cropping_flipping,
+        "translation_brightness": get_translation_brightness,
+        "rotation_noise": get_rotation_noise,
+        "scaling_cropping": get_scaling_cropping,
+        "contrast_noise": get_contrast_noise,
+        "noise_blurring": get_noise_blurring,
+        "rotation_translation_pair": get_rotation_translation_pair,
+
+        "rotation_scaling_flipping": get_rotation_scaling_flipping,
+        "geometric_four": get_geometric_four,
+
+        "none": lambda: None,
+    }
+
+    if name not in augmentations:
+        raise ValueError(f"Unknown augmentation: {name}")
+
+    return augmentations[name]()
+
+    if name not in augmentations:
+        raise ValueError(f"Unknown augmentation: {name}")
+
+    return augmentations[name]()
 
 # =========================
 # DATA PREPARATION
 # =========================
 
-def prepare_data():
+def prepare_data(augmentation_name):
     print("Loading CIFAR-10...")
 
     X_train, y_train, X_test, y_test = load_cifar10()
@@ -87,10 +133,7 @@ def prepare_data():
     X_test = X_test.astype(np.float32) / 255.0
 
     # Data augmentation
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-    ])
+    train_transform = build_augmentation(augmentation_name)
 
     # Convert arrays to tensors
     X_train_tensor = torch.from_numpy(X_train_part)
@@ -130,7 +173,19 @@ def prepare_data():
 
         def __getitem__(self, index):
             image, label = self.dataset[index]
-            image = self.transform(image)
+
+            if self.transform is not None:
+                # PyTorch CHW -> NumPy HWC для Albumentations
+                image = image.permute(1, 2, 0).numpy()
+
+                # Albumentations вяртае dict з ключом "image"
+                image = self.transform(image=image)["image"]
+
+                # NumPy HWC -> PyTorch CHW
+                image = torch.from_numpy(
+                    np.ascontiguousarray(image)
+                ).permute(2, 0, 1).float()
+
             return image, label
 
     train_dataset = AugmentedDataset(
@@ -278,7 +333,9 @@ def main():
     device = get_device()
     mlflow.set_experiment("CIFAR10_MLP_Mixer")
 
-    with mlflow.start_run():
+    run_name = AUGMENTATION
+
+    with mlflow.start_run(run_name=run_name):
         mlflow.log_params({
             "model": "MLP-Mixer",
             "batch_size": BATCH_SIZE,
@@ -290,6 +347,7 @@ def main():
             "scheduler": "CosineAnnealingLR",
             "seed": SEED,
             "val_size": VAL_SIZE,
+            "augmentation": AUGMENTATION,
         })
 
         print("Device:", device)
@@ -298,7 +356,7 @@ def main():
             print("GPU:", torch.cuda.get_device_name(0))
             torch.backends.cudnn.benchmark = True
 
-        train_loader, val_loader, test_loader = prepare_data()
+        train_loader, val_loader, test_loader = prepare_data(AUGMENTATION)
 
         model = MLPMixer(
             image_size=32,
